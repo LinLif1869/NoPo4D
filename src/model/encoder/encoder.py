@@ -128,11 +128,13 @@ class EncoderNoPo4D(Encoder[EncoderNoPo4DCfg]):
         layers_tokens: list[LayerTokens],
         run_gaussian_head: bool,
         average_poses: bool = True,
+        fixed_camera_pose: CameraPoseDict | None = None,
     ) -> EncoderOutput:
         """Run camera, depth, motion and Gaussian heads."""
 
         # Predict camera poses and depth maps
-        camera_pose = self._predict_camera_poses(scene_input, layers_tokens, average_poses)
+        camera_pose = (fixed_camera_pose if fixed_camera_pose is not None else
+                       self._predict_camera_poses(scene_input, layers_tokens, average_poses))
         depth = self._predict_depth_maps(scene_input, layers_tokens)
 
         if not run_gaussian_head:
@@ -162,6 +164,8 @@ class EncoderNoPo4D(Encoder[EncoderNoPo4DCfg]):
         input_extrinsics: Float[Tensor, "batch view 4 4"] | None = None,
         input_intrinsics: Float[Tensor, "batch view 3 3"] | None = None,
         average_poses: bool = True,
+        fixed_extrinsics: Float[Tensor, "batch view 4 4"] | None = None,
+        fixed_intrinsics: Float[Tensor, "batch view 3 3"] | None = None,
     ) -> EncoderOutput:
         """Encode multi-view images into 3D/4D Gaussians with predicted camera poses.
 
@@ -176,10 +180,32 @@ class EncoderNoPo4D(Encoder[EncoderNoPo4DCfg]):
             input_extrinsics: Optional known w2c extrinsics to condition the backbone camera encoder.
             input_intrinsics: Optional known intrinsics to condition the backbone camera encoder.
             average_poses: If True, averages predicted pose encodings across time per camera to enforce static cameras.
+            fixed_extrinsics: Optional w2c matrices replacing the camera prediction head.
+            fixed_intrinsics: Pixel intrinsics paired with fixed_extrinsics. Used directly,
+                including off-center principal points, by geometry and rendering.
 
         Returns:
             EncoderOutput with Gaussians, camera poses, depth maps, optical flow, and metadata.
         """
+        fixed_camera_pose = None
+        if (fixed_extrinsics is None) != (fixed_intrinsics is None):
+            raise ValueError('fixed_extrinsics and fixed_intrinsics must be supplied together')
+        if fixed_extrinsics is not None:
+            if input_extrinsics is not None or input_intrinsics is not None:
+                raise ValueError('Do not combine fixed cameras with backbone camera conditioning')
+            b, v = images.shape[:2]
+            if fixed_extrinsics.shape != (b, v, 4, 4) or fixed_intrinsics.shape != (b, v, 3, 3):
+                raise ValueError('Fixed camera shapes must match the image batch and view dimensions')
+            w2c = fixed_extrinsics.detach().to(device=images.device, dtype=torch.float32)
+            intrinsic = fixed_intrinsics.detach().to(device=images.device, dtype=torch.float32)
+            if not torch.isfinite(w2c).all() or not torch.isfinite(intrinsic).all():
+                raise ValueError('Fixed camera matrices must be finite')
+            fixed_camera_pose = {
+                'extrinsic_w2c': w2c,
+                'extrinsic_c2w': affine_inverse(w2c),
+                'intrinsic': intrinsic,
+                'encodings': [extri_intri_to_pose_encoding(w2c, intrinsic, images.shape[-2:])],
+            }
         scene_input = SceneInput(
             image=self.backbone.normalize(images),
             num_cameras=int(num_cameras),
@@ -195,6 +221,7 @@ class EncoderNoPo4D(Encoder[EncoderNoPo4DCfg]):
 
         # Predict heads output in full precision
         with torch.autocast(device_type, enabled=False):
-            encoder_output = self._run_heads(scene_input, layers_tokens, run_gaussian_head, average_poses)
+            encoder_output = self._run_heads(
+                scene_input, layers_tokens, run_gaussian_head, average_poses, fixed_camera_pose)
         
         return encoder_output
